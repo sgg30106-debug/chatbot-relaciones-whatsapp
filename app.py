@@ -15,6 +15,12 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 APP_SECRET = os.getenv("APP_SECRET")  # opcional: valida la firma de Meta
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+PUBLIC_URL = os.getenv("PUBLIC_URL") or (
+    f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}" if os.getenv("RAILWAY_PUBLIC_DOMAIN") else None
+)
+TG_SECRET = hashlib.sha256((TELEGRAM_TOKEN or "").encode()).hexdigest()[:32]
+TG_API = "https://api.telegram.org/bot{}/{}"
 GRAPH_URL = "https://graph.facebook.com/v21.0/{}/messages"
 
 # ---------------- Contenido (formato WhatsApp: *negrita*, _cursiva_) ----------------
@@ -139,8 +145,10 @@ TEXT_ALIASES = {
     "menu": "menu", "menú": "menu", "hola": "menu", "inicio": "menu", "start": "menu", "/start": "menu",
     "trivia": "menu_trivias", "trivias": "menu_trivias",
     "consejos": "menu_consejos", "ayuda": "menu_rutas", "rutas": "menu_rutas",
-    "semana1": "semana1", "/semana1": "semana1", "semana 1": "semana1",
 }
+for _n in range(1, 5):
+    for _k in (f"semana{_n}", f"/semana{_n}", f"semana {_n}"):
+        TEXT_ALIASES[_k] = f"semana{_n}"
 
 
 def handle_action(to, action, nombre=""):
@@ -184,6 +192,95 @@ def valid_signature(req):
     sig = req.headers.get("X-Hub-Signature-256", "")
     expected = "sha256=" + hmac.new(APP_SECRET.encode(), req.get_data(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, expected)
+
+
+# ---------------- Telegram (mismo contenido, por webhook) ----------------
+
+
+def tg(method, payload):
+    try:
+        r = requests.post(TG_API.format(TELEGRAM_TOKEN, method), json=payload, timeout=15)
+        if not r.ok:
+            log.error("Error Telegram %s: %s %s", method, r.status_code, r.text)
+        return r
+    except requests.RequestException:
+        log.exception("Fallo de red con Telegram")
+
+
+def tg_send(chat_id, text, buttons=None):
+    """buttons: lista de filas; cada fila es lista de (callback_id, título)."""
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": [
+            [{"text": t, "callback_data": i} for i, t in row] for row in buttons
+        ]}
+    tg("sendMessage", payload)
+
+
+def tg_action(chat_id, action, nombre=""):
+    saludo = BIENVENIDA.format(nombre=f", {nombre}" if nombre else "")
+    if action == "menu":
+        tg_send(chat_id, saludo, [
+            [("menu_trivias", "📝 Hacer Trivia de la Semana")],
+            [("menu_consejos", "💡 Ver Consejos de Prevención")],
+            [("menu_rutas", "📞 Líneas de Ayuda y Rutas")],
+        ])
+    elif action == "menu_trivias":
+        tg_send(chat_id, "*Selecciona la semana que deseas consultar:*",
+                [[(sid, f"{t}: {d}")] for sid, t, d in SEMANAS])
+    elif action == "menu_consejos":
+        tg_send(chat_id, CONSEJOS)
+    elif action == "menu_rutas":
+        tg_send(chat_id, RUTAS)
+    elif action == "semana1":
+        tg_send(chat_id, S1_PREGUNTA, [[("s1_mito", "Mito"), ("s1_realidad", "Realidad")]])
+    elif action in ("semana2", "semana3", "semana4"):
+        tg_send(chat_id, PROXIMAMENTE)
+    elif action == "s1_mito":
+        tg_send(chat_id, S1_MITO)
+    elif action == "s1_realidad":
+        tg_send(chat_id, S1_REALIDAD)
+    else:
+        tg_action(chat_id, "menu", nombre)
+
+
+def process_telegram(update):
+    if "callback_query" in update:
+        cq = update["callback_query"]
+        tg("answerCallbackQuery", {"callback_query_id": cq["id"]})
+        tg_action(cq["message"]["chat"]["id"], cq.get("data", "menu"), cq["from"].get("first_name", ""))
+    elif "message" in update:
+        m = update["message"]
+        texto = (m.get("text") or "").strip().lower().split("@")[0]
+        tg_action(m["chat"]["id"], TEXT_ALIASES.get(texto, "menu"), m.get("from", {}).get("first_name", ""))
+
+
+@app.route("/telegram", methods=["POST"])
+def telegram_webhook():
+    if not TELEGRAM_TOKEN:
+        return "telegram deshabilitado", 404
+    if not hmac.compare_digest(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), TG_SECRET):
+        return "no autorizado", 403
+    try:
+        process_telegram(request.get_json(silent=True) or {})
+    except Exception:
+        log.exception("Error procesando update de Telegram")
+    return jsonify({"status": "ok"}), 200
+
+
+def setup_telegram():
+    if not TELEGRAM_TOKEN:
+        log.info("TELEGRAM_TOKEN no definido: Telegram deshabilitado")
+        return
+    if not PUBLIC_URL:
+        log.warning("Sin PUBLIC_URL ni RAILWAY_PUBLIC_DOMAIN: no se registra el webhook de Telegram")
+        return
+    r = tg("setWebhook", {"url": f"{PUBLIC_URL}/telegram", "secret_token": TG_SECRET,
+                          "allowed_updates": ["message", "callback_query"]})
+    log.info("setWebhook Telegram: %s", r.text if r is not None else "fallo")
+
+
+setup_telegram()
 
 
 @app.route("/")
